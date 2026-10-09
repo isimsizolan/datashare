@@ -1,0 +1,295 @@
+# Draftingassist Background Job Scheduler: Design Concept
+
+> Based on `draftingassist-backend` at `403497d` (2026-07-01). Every claim has a `file:line`.
+> Companion to `db-backed-job-queue-pattern.md` (the generic pattern). This file is the concrete design for draftingassist.
+
+## 1. Recap and verdict
+
+- **What it is:** a Postgres table used as the job queue. One background thread claims jobs with `FOR UPDATE SKIP LOCKED`, commits, and hands them to a thread pool. A dispatcher dict maps `job_type` to a handler. A Postgres advisory lock is meant to make only one scheduler run across all workers and pods.
+- **Verdict:** the core (claim, commit, then work) is the same design used by Solid Queue, GoodJob, Oban and River, and it is solid. The weak parts sit around it:
+  - retries never stop
+  - recovering orphaned jobs relies on startup reset
+  - the scheduler is only elected at startup, so it can silently disappear after a deploy
+- **Target:** drop leader election. Let every worker claim jobs; the row lock already makes that safe. Add heartbeat, a fencing token and a dead-letter state. This is about 150 changed lines, and about 100 lines of lock-guard code get deleted.
+
+## 2. How it works today
+
+```
+uvicorn (4 workers, Dockerfile:87)  x  pods (HPA 1-4, prod.values.yaml:101)
+  startup_event -> pg_try_advisory_lock(839271365) on a dedicated raw connection (main.py:70-170, :216)
+     |-- lock acquired -> start_scheduler()
+     '-- not acquired  -> no scheduler in this worker, never retried
+start_scheduler (scheduler.py:81)
+  reset processing/failed -> pending      (scheduler.py:99, command.py:187)
+  ThreadPoolExecutor(batch_size + 2 = 7)  (scheduler.py:102-103)
+  loop every 5 s (scheduler.py:48-76):
+     claim due maintenance jobs (all)     (query.py:1059-1070)
+     claim up to 5 regular jobs           (query.py:1038-1047)
+     mark processing, COMMIT              (scheduler.py:36)
+     submit each job to the pool          (scheduler.py:39)
+process_background_job (background_process.py)
+  own DB session -> dispatcher -> handler(job_data) -> 0 / -1
+  regular: completed | retry_count+1     maintenance: next_run_at = now + interval
+```
+
+**Table `dassist_backgroundjob`** (V23 migration, `models/backgroundjob.py:8`):
+- `job_type`, `job_category` (regular | maintenance), `status`, `retry_count`, `max_retries` (3), `error_message`, `job_data` (JSON), `completed_at`, `interval_seconds`, `last_run_at`, `next_run_at`, plus the standard `createdat`, `updatedat` and `isdeleted`.
+- `status` has no CHECK constraint, so adding new states needs no DDL.
+
+**Status flow today:**
+- Regular jobs: `pending → processing → completed`. On failure the job goes back to `pending` while it has retries left, then to `failed`.
+- Maintenance jobs: `pending → processing → pending`, with `next_run_at` pushed forward on both success and failure.
+
+## 3. What is good (keep it)
+
+| Property | Where | Why it matters |
+|---|---|---|
+| Claim with `FOR UPDATE SKIP LOCKED`, explicit order | `query.py:1047`, `:1070` | Many claimers never take the same row and never wait on each other |
+| Claim transaction is short: claim, mark, commit, then work | `scheduler.py:36` | No lock and no connection is held during long work |
+| Each job opens its own session | `background_process.py:23` | Pool threads never share a session |
+| Dispatcher is a plain dict | `dispatcher.py` | Easy to grep, easy to review, nothing registers by accident |
+| Unknown `job_type` counts as a failed attempt, not a crash | `background_process.py:28-35` | A typo in a producer cannot kill the loop |
+| Maintenance jobs are rows with `next_run_at` | `command.py:242-258` | Recurring work needs no APScheduler; failures back off too |
+| Handlers treat "already done" as success | `session_cleanup.py` (session not found → 0) | Safe to run twice, which is the base requirement |
+
+## 4. The three points from the first review
+
+These are still true in the current code.
+
+**P1. Failed jobs retry forever, about every 5 seconds.**
+- After `max_retries` the status becomes `failed` (`command.py:233-234`).
+- The claim query takes both `pending` and `failed` (`query.py:1045`), so the "final" state is picked up again on the next cycle.
+- Below the limit the job goes straight back to `pending` (`:236`) with no delay.
+- The startup reset revives `failed` jobs too (`command.py:192`).
+- Result: a poison job runs every 5 s for as long as the app runs, and calls the same external service every time.
+
+**P2. Orphaned jobs are only recovered by a reset at startup and shutdown** (`scheduler.py:99`, `:158`).
+- The singleton lock makes this acceptable only while exactly one scheduler exists and the previous one is really dead. It breaks in two cases:
+  - **Zombie leader.** The leader loses its lock connection but keeps running (see F2). The next leader resets jobs that are still running, and they run twice.
+  - **Shutdown window.** `shutdown(wait=False, cancel_futures=True)` (`scheduler.py:154`) does not stop running threads. Line 158 then resets their jobs to `pending` while they are still running.
+
+**P3. Regular jobs ignore `next_run_at`** (`query.py:1043-1047`). There is nowhere to put a backoff delay, and this is the root of P1.
+
+## 5. Additional findings from the full read
+
+**F1. The scheduler can disappear after a deploy or a scale-down. Severity: high. Confirm with the check below.**
+- **Setup:** the lock is attempted only in `startup_event` (`main.py:216`) and nothing tries again later. The chart sets no `strategy` and no `terminationGracePeriodSeconds`, so Kubernetes uses the default RollingUpdate.
+- **What happens on a deploy:**
+  1. The new pod starts while the old pod still holds the lock.
+  2. All 4 workers in the new pod try once and give up.
+  3. The old pod gets SIGTERM and releases the lock (`main.py:34-41`).
+  4. Nobody holds the lock now, and no jobs run until some worker restarts.
+- **Same outcome:** HPA scaling down the pod that holds the lock.
+- **Check after the next deploy:**
+  - Look in the pod logs for `[SCHEDULER] Advisory lock acquired` versus `Skipping`.
+  - Run this to see if anyone holds the lock right now:
+
+```sql
+SELECT a.pid, a.application_name, a.state, a.backend_start
+FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+WHERE l.locktype = 'advisory' AND l.objid = 839271365;   -- classid = 0 for this id
+```
+
+No rows while jobs are piling up in `pending` means the scheduler is down.
+
+**F2. The stale-lock recovery checks a case that does not happen, and misses the one that does.**
+- **What the comment assumes** (`main.py:76-80`, branch `:125-153`): a killed pod leaves a lock-holding backend with no `pg_stat_activity` row.
+- **Why that case doesn't happen:**
+  - When a *process* dies, the OS closes its socket, Postgres sees the disconnect, and the lock is released on its own.
+  - A backend that holds a session-level advisory lock always has a `pg_stat_activity` row, so this branch is effectively dead code.
+- **The case that does leave a stale lock:**
+  - A node is lost, the network splits, or a load balancer or NAT silently drops the idle flow. Azure LB idle timeouts apply here, and this connection sends no traffic after it takes the lock.
+  - The backend then stays **alive and idle** until server keepalive notices, and the check treats it as a live holder.
+  - In the drop case the old process may also keep running its scheduler without knowing it lost the lock, which gives two schedulers.
+- **Fix:**
+  - Set TCP keepalives on the dedicated connection (`keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3`).
+  - Check server-side `SHOW tcp_keepalives_idle;`.
+  - Or remove the need for the lock entirely (section 7).
+
+**F3. The scheduler claims more jobs than it can run.**
+- The pool has 7 threads (`scheduler.py:102-103`), but every 5 s the loop claims up to 5 regular jobs plus every due maintenance job (`:25`, `:31`), however many threads are free.
+- The code itself says jobs "can run for hours" (`scheduler.py:151`). Once the threads are busy, claimed jobs pile up in the executor queue marked `processing` but not running.
+- On shutdown `cancel_futures=True` drops them, and only the reset at line 158 saves them.
+- Fix: claim only as many jobs as there are free slots.
+
+**F4. Every timestamp uses the pod clock** (`datetime.now()`, naive local time, all over `command.py`). With several pods, clock drift or timezone differences shift `next_run_at` and any time-based recovery. Use the database clock (`func.now()`) everywhere.
+
+**F5. "Job B needs job A to finish first" is not guaranteed.** Jobs are claimed in `createdat` order but run in parallel threads, so B can start before A finishes. Ordering has to live inside one claimed unit (section 7.6).
+
+**F6. Shutdown grace period.** It is the default 30 s, while jobs take hours, so every deploy cuts running jobs off. This is acceptable only because recovery and idempotency cover it. Graceful shutdown cannot.
+
+## 6. The orphan riddle
+
+**Problem:** a job is in `processing`. Is its owner dead, or still working on another pod or cluster?
+
+**PID + hostname cannot answer that:**
+- You cannot check a process on another machine.
+- PIDs repeat; the main process is PID 1 in every container.
+- Pod names can come back.
+- A paused process (GC, CPU throttling, network split) looks dead and then wakes up.
+
+**What the industry does (usually combined):**
+
+| Technique | How | Used by |
+|---|---|---|
+| **Heartbeat / lease** | Owner updates `heartbeat_at`; a job whose heartbeat is too old is reclaimed | Solid Queue (`processes.last_heartbeat_at`), Oban Lifeline, River rescuer, Sidekiq Pro super_fetch, K8s Lease, SQS visibility timeout |
+| **Lock tied to the connection** | Hold `pg_advisory_lock(job)` while working; a dead process means a dropped connection and a released lock | GoodJob. Costs one connection per running job and does not work behind PgBouncer in transaction mode |
+| **Fencing token** | Each claim increments `attempt`; the final write only counts if `attempt` still matches | Kleppmann's answer to the zombie: a heartbeat says who *should* own the job, the token makes the loser harmless |
+
+**Rules:**
+- Identity is a random `worker_id` UUID created when the process starts. Keep `hostname:pid` only as a label for humans.
+- Use only the database clock.
+- All clusters must share one database. Separate databases mean separate queues, which is fine but is not one queue.
+
+## 7. Target design
+
+**Principle (from the pattern doc):** make the code not care about topology. The singleton never made the system correct; the row lock did. With heartbeat and fencing in place, every worker in every pod can claim jobs, and a deploy, a scale-down or a lost node only delays work.
+
+### 7.1 Schema (V24)
+
+```sql
+ALTER TABLE dassist_backgroundjob
+  ADD COLUMN locked_by    uuid,
+  ADD COLUMN heartbeat_at timestamptz,
+  ADD COLUMN started_at   timestamptz,
+  ADD COLUMN attempt      int NOT NULL DEFAULT 0;
+
+-- status values: pending | processing | completed | failed | failed_permanent
+CREATE INDEX IF NOT EXISTS idx_backgroundjob_claim
+  ON dassist_backgroundjob (status, next_run_at, createdat) WHERE isdeleted = false;
+CREATE INDEX IF NOT EXISTS idx_backgroundjob_heartbeat
+  ON dassist_backgroundjob (heartbeat_at) WHERE status = 'processing' AND isdeleted = false;
+```
+
+- `failed` now means "will retry after `next_run_at`".
+- `failed_permanent` means "a person has to look at this" (dead letter).
+
+### 7.2 Claim (all workers, only free slots)
+
+```python
+WORKER_ID = uuid4()                       # once per process
+slots = threading.BoundedSemaphore(POOL_SIZE)
+
+def claim(db, n):
+    jobs = (db.query(BackgroundJob)
+              .filter(BackgroundJob.status.in_(["pending", "failed"]),
+                      or_(BackgroundJob.next_run_at.is_(None), BackgroundJob.next_run_at <= func.now()),
+                      BackgroundJob.isdeleted == False)
+              .order_by(BackgroundJob.next_run_at.nullsfirst(), BackgroundJob.createdat)
+              .limit(n).with_for_update(skip_locked=True).all())
+    for j in jobs:
+        j.status, j.locked_by = "processing", WORKER_ID
+        j.started_at = j.heartbeat_at = func.now()
+        j.attempt += 1
+    db.commit()
+    return jobs   # hand (id, attempt) to the thread, never the ORM object
+```
+
+- The loop calls `claim(db, free_slots)`, where `free_slots` comes from the semaphore. A job is never `processing` unless a thread is actually running it.
+- Maintenance and regular jobs use the same query. A maintenance job is just a row with `next_run_at`, and `SKIP LOCKED` guarantees only one worker claims each due run.
+
+### 7.3 Heartbeat (one thread per process)
+
+```sql
+-- every 30 s; :running_ids = ids this process is executing right now (tracked in memory)
+UPDATE dassist_backgroundjob SET heartbeat_at = now()
+WHERE id = ANY(:running_ids) AND locked_by = :worker_id AND status = 'processing';
+```
+
+Heartbeat only the jobs that are actually running, not every row with `locked_by = me`. A hung thread keeps a live process heartbeating, so also enforce a maximum runtime per job type in the reaper.
+
+### 7.4 Reaper (any worker, every cycle; safe to run on many at once)
+
+```sql
+UPDATE dassist_backgroundjob
+SET status = 'pending', locked_by = NULL,
+    error_message = coalesce(error_message, '') || ' [reclaimed: owner silent]'
+WHERE status = 'processing' AND isdeleted = false
+  AND heartbeat_at < now() - interval '2 minutes';
+```
+
+- The timeout no longer depends on how long a job takes. A 3-hour job keeps heartbeating, and a dead pod's jobs come back in about 2 minutes.
+- No reset at startup. No reset at shutdown.
+
+### 7.5 Finishing a job (fenced)
+
+```sql
+-- success, regular
+UPDATE dassist_backgroundjob
+SET status = 'completed', completed_at = now(), locked_by = NULL, updatedat = now()
+WHERE id = :id AND locked_by = :worker_id AND attempt = :attempt;
+
+-- failure: retry with backoff, or dead-letter
+UPDATE dassist_backgroundjob
+SET retry_count = retry_count + 1, error_message = :err, locked_by = NULL, updatedat = now(),
+    status      = CASE WHEN retry_count + 1 >= max_retries THEN 'failed_permanent' ELSE 'failed' END,
+    next_run_at = now() + make_interval(secs => least(30 * power(2, retry_count), 3600))
+WHERE id = :id AND locked_by = :worker_id AND attempt = :attempt;
+
+-- maintenance (success or failure): back to the schedule
+UPDATE dassist_backgroundjob
+SET status = 'pending', locked_by = NULL, last_run_at = now(), updatedat = now(),
+    next_run_at = now() + make_interval(secs => interval_seconds),
+    retry_count = CASE WHEN :ok THEN 0 ELSE retry_count + 1 END
+WHERE id = :id AND locked_by = :worker_id AND attempt = :attempt;
+```
+
+If 0 rows are updated, someone else owns the job now. Log it and discard the result. Any side effects already done are covered by idempotent handlers.
+
+### 7.6 Jobs that depend on each other
+
+Never order jobs through separate rows. If B needs A, make one job whose handler runs A then B, and record progress per step in `job_data` or in the domain rows. That way a retry continues from the right step.
+
+### 7.7 Shutdown
+
+- On SIGTERM: stop claiming and let running jobs keep going until the grace period ends.
+- Reset nothing. Whatever does not finish is reclaimed by the reaper on another pod.
+- Because claims match free slots, there are no "claimed but not started" jobs to clean up.
+
+### 7.8 What gets deleted
+
+- the advisory lock guard (`main.py:44-194` and the call at `:216`)
+- `_reset_stale_processing_jobs` and its two calls
+- `reset_processing_jobs_to_pending`
+- the global `_execution_lock`: the loop is already sequential, so it does nothing (`scheduler.py:18`)
+
+### 7.9 Monitoring (free, because the state is in rows)
+
+```sql
+SELECT status, count(*) FROM dassist_backgroundjob WHERE isdeleted = false GROUP BY status;
+SELECT * FROM dassist_backgroundjob WHERE status = 'failed_permanent' ORDER BY updatedat DESC;   -- the human queue
+SELECT max(now() - createdat) FROM dassist_backgroundjob WHERE status = 'pending' AND next_run_at IS NULL;  -- lag
+SELECT count(*) FROM dassist_backgroundjob WHERE status = 'processing' AND heartbeat_at < now() - interval '1 minute';
+```
+
+## 8. If you keep the singleton (quick patch instead of section 7)
+
+1. Workers without the lock call `pg_try_advisory_lock` again on every loop iteration, not only at startup. This fixes F1.
+2. The holder checks once per cycle that it still holds the lock, and stops if it doesn't:
+   `SELECT 1 FROM pg_locks WHERE locktype='advisory' AND objid=839271365 AND pid=pg_backend_pid()`
+3. Set keepalives on the lock connection. This fixes F2.
+4. Fix P1, P3 and F3 as in 7.2 and 7.5.
+
+You still need fencing (7.5) even with a correct singleton. A new leader cannot tell a dead old leader from a paused one. This patch is smaller than section 7 but keeps more code, so section 7 is the recommendation.
+
+## 9. Migration steps
+
+1. V24 migration (7.1). It only adds columns, so the old code keeps working.
+2. Claim with free slots and `next_run_at` (7.2). This fixes P3 and F3.
+3. Fenced finishing, backoff and `failed_permanent` (7.5). This fixes P1. Move existing `failed` rows whose `retry_count >= max_retries` to `failed_permanent` in the migration.
+4. Heartbeat thread and reaper (7.3, 7.4).
+5. Delete the startup/shutdown reset and the advisory lock guard (7.8). This fixes P2, F1 and F2.
+6. Replace `datetime.now()` with `func.now()` in the job paths (F4).
+
+## 10. Tests before calling it done
+
+| Scenario | Expected |
+|---|---|
+| `kill -9` a worker while it runs a job | Job reclaimed within about 2 min, runs once more, handler stays idempotent |
+| Rolling deploy with a job running | New pod claims new work immediately; old job finishes or is reclaimed; never 0 schedulers |
+| HPA scales down a pod | Same as above |
+| Network drop on one pod (iptables/NetworkPolicy) | Its jobs are reclaimed; when it comes back its late finish updates 0 rows (fencing works) |
+| Poison job (handler always returns -1, `max_retries` 3) | Runs 3 times with 30 s and 60 s gaps, then `failed_permanent`, then stops |
+| 50 long jobs queued, pool of 7 | At most 7 rows in `processing` per process |
+| 2 pods, 4 workers each, one maintenance job due | Exactly one run per due time |
+
